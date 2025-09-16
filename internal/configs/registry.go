@@ -92,6 +92,10 @@ func NewRegistryWithDefault() *Registry {
 			CenterEverything:      false,
 			NeteaseCookie:         "",
 			Debug:                 false,
+			HTTPController: HTTPControllerOptions{
+				Enable: false,
+				Port:   23333,
+			},
 		},
 		Storge: StorgeOptions{
 			DownloadDir:           "",
@@ -201,6 +205,9 @@ func NewRegistryFromIniFile(filepath string) *Registry {
 	registry.Main.CenterEverything = ini.Bool("main.centerEverything", false)
 	registry.Main.NeteaseCookie = ini.String("main.neteaseCookie", "")
 	registry.Main.Debug = ini.Bool("main.debug", false)
+
+	registry.Main.HTTPController.Enable = ini.Bool("main.httpControllerEnable", false)
+	registry.Main.HTTPController.Port = ini.Int("main.httpControllerPort", 23333)
 
 	downloadDir := ini.String("main.downloadDir", "")
 	downloadLyricDir := ini.String("main.downloadLyricDir", "")

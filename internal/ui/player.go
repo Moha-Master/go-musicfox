@@ -2,9 +2,11 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
+	"math/rand"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +62,64 @@ const (
 	CtrlRerender CtrlType = "Rerender"
 )
 
+// httpPlayerController is an adapter to implement PlayerController interface
+type httpPlayerController struct {
+	player *Player
+}
+
+func (c *httpPlayerController) SetPlayMode(mode types.Mode) error {
+	return c.player.playlistManager.SetPlayMode(mode)
+}
+
+func (c *httpPlayerController) Rerender() {
+	c.player.ctrl <- CtrlSignal{Type: CtrlRerender}
+}
+
+func (c *httpPlayerController) Play() {
+	c.player.ctrl <- CtrlSignal{Type: CtrlResume}
+}
+
+func (c *httpPlayerController) Pause() {
+	c.player.ctrl <- CtrlSignal{Type: CtrlPaused}
+}
+
+func (c *httpPlayerController) Next() {
+	c.player.ctrl <- CtrlSignal{Type: CtrlNext}
+}
+
+func (c *httpPlayerController) Previous() {
+	c.player.ctrl <- CtrlSignal{Type: CtrlPrevious}
+}
+
+func (c *httpPlayerController) NextPlayMode() {
+	c.player.SwitchMode()
+}
+
+func (c *httpPlayerController) ActivateIntelligentMode() error {
+	go func() {
+		if err := c.player.ActivateIntelligentModeRandomly(); err != nil {
+			slog.Error("Failed to activate intelligent mode via API", slog.Any("err", err))
+		}
+	}()
+	return nil
+}
+
+func (c *httpPlayerController) GetStatus() control.PlayerStatus {
+	return c.player.GetPlayerStatus()
+}
+
+func (c *httpPlayerController) SetVolume(volume int) {
+	c.player.SetVolume(volume)
+}
+
+func (c *httpPlayerController) VolumeUp() {
+	c.player.UpVolume()
+}
+
+func (c *httpPlayerController) VolumeDown() {
+	c.player.DownVolume()
+}
+
 // Player 网易云音乐播放器
 type Player struct {
 	netease *Netease
@@ -87,6 +147,9 @@ type Player struct {
 	playErrCount int // 错误计数，当错误连续超过5次，停止播放
 	stateHandler *control.RemoteControl
 	ctrl         chan CtrlSignal
+
+	httpController *control.HTTPController // http controller
+	pauseTicker    *time.Ticker            // pause ticker
 
 	renderTicker *tickerByPlayer // renderTicker 用于渲染
 
@@ -117,7 +180,28 @@ func NewPlayer(n *Netease) *Player {
 	p.Player = player.NewPlayerFromConfig()
 	p.stateHandler = control.NewRemoteControl(p, p.PlayingInfo())
 
+	if configs.ConfigRegistry.Main.HTTPController.Enable {
+		p.httpController = control.NewHTTPController(&httpPlayerController{player: p})
+		p.httpController.Run(configs.ConfigRegistry.Main.HTTPController.Port)
+	}
+
 	p.renderTicker = newTickerByPlayer(p)
+	p.pauseTicker = time.NewTicker(5 * time.Second)
+	p.pauseTicker.Stop() // Stop it initially
+
+	// Pause Ticker
+	errorx.WaitGoStart(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-p.pauseTicker.C:
+				if p.httpController != nil {
+					p.httpController.BroadcastStatus(p.GetPlayerStatus())
+				}
+			}
+		}
+	})
 
 	// remote control
 	errorx.WaitGoStart(func() {
@@ -139,6 +223,9 @@ func NewPlayer(n *Netease) *Player {
 				return
 			case s := <-p.StateChan():
 				p.stateHandler.SetPlayingInfo(p.PlayingInfo())
+				if p.httpController != nil {
+					p.httpController.BroadcastStatus(p.GetPlayerStatus())
+				}
 				if s != types.Stopped {
 					p.netease.Rerender(false)
 					break
@@ -156,6 +243,9 @@ func NewPlayer(n *Netease) *Player {
 				return
 			case duration := <-p.TimeChan():
 				p.stateHandler.SetPosition(p.PassedTime())
+				if p.httpController != nil {
+					p.httpController.BroadcastStatus(p.GetPlayerStatus())
+				}
 				if duration.Seconds()-p.CurMusic().Duration.Seconds() > 10 {
 					p.NextSong(false)
 				}
@@ -903,24 +993,51 @@ func (p *Player) SetVolume(volume int) {
 }
 
 func (p *Player) handleControlSignal(signal CtrlSignal) {
-	switch signal.Type {
-	case CtrlPaused:
-		p.Pause()
-	case CtrlResume:
-		p.Resume()
-	case CtrlStop:
-		p.Stop()
-	case CtrlToggle:
-		p.Toggle()
-	case CtrlPrevious:
-		p.PreviousSong(true)
-	case CtrlNext:
-		p.NextSong(true)
-	case CtrlSeek:
-		p.Seek(signal.Duration)
-	case CtrlRerender:
-		p.netease.Rerender(false)
-	}
+    switch signal.Type {
+    case CtrlPaused:
+        p.Pause()
+        if p.pauseTicker != nil {
+            p.pauseTicker.Reset(5 * time.Second)
+        }
+    case CtrlResume:
+        // If player is stopped, we should re-play the song
+        if (p.State() == types.Stopped || p.State() == types.Interrupted) && p.CurSong().Id > 0 {
+            p.PlaySong(p.CurSong(), DurationNext)
+        } else {
+            p.Resume()
+        }
+        if p.pauseTicker != nil {
+            p.pauseTicker.Stop()
+        }
+    case CtrlStop:
+        p.Stop()
+        if p.pauseTicker != nil {
+            p.pauseTicker.Stop()
+        }
+    case CtrlToggle:
+        p.Toggle()
+        if p.pauseTicker != nil {
+            if p.State() == types.Paused {
+                p.pauseTicker.Reset(5 * time.Second)
+            } else {
+                p.pauseTicker.Stop()
+            }
+        }
+    case CtrlPrevious:
+        p.PreviousSong(true)
+        if p.pauseTicker != nil {
+            p.pauseTicker.Stop()
+        }
+    case CtrlNext:
+        p.NextSong(true)
+        if p.pauseTicker != nil {
+            p.pauseTicker.Stop()
+        }
+    case CtrlSeek:
+        p.Seek(signal.Duration)
+    case CtrlRerender:
+        p.netease.Rerender(false)
+    }
 }
 
 func (p *Player) PlayingInfo() control.PlayingInfo {
@@ -942,4 +1059,96 @@ func (p *Player) PlayingInfo() control.PlayingInfo {
 
 func (p *Player) RenderTicker() model.Ticker {
 	return p.renderTicker
+}
+
+// GetPlayerStatus collects and returns the current player status
+func (p *Player) GetPlayerStatus() control.PlayerStatus {
+	song := p.CurSong()
+	isPlaying := p.State() == types.Playing
+	playMode := p.playlistManager.GetPlayMode()
+	loggedIn := p.netease.user != nil
+
+	var currentLyric string
+	if p.lrcTimer != nil {
+		// lyrics[2] is the currently highlighted line
+		currentLyric = p.lyrics[2]
+	}
+
+	return control.PlayerStatus{
+		SongTitle:      song.Name,
+		Artist:         song.ArtistName(),
+		IsPlaying:      isPlaying,
+		PlayMode:       uint8(playMode),
+		SongDuration:   song.Duration,
+		PlaybackPlayed: p.PassedTime(),
+		Lyric:          currentLyric,
+		IsLoggedIn:     loggedIn,
+		Volume:         p.Volume(),
+	}
+}
+
+func (p *Player) ActivateIntelligentModeRandomly() error {
+	slog.Info("[Intelligent Mode API] Starting...")
+	if _struct.CheckUserInfo(p.netease.user) == _struct.NeedLogin {
+		return errors.New("need login")
+	}
+
+	// 1. 获取"我喜欢的音乐"歌单
+	slog.Info("[Intelligent Mode API] Step 1: Getting liked songs playlist...")
+	detailService := service.PlaylistDetailService{Id: strconv.FormatInt(p.netease.user.MyLikePlaylistID, 10)}
+	code, response := detailService.PlaylistDetail()
+	codeType := _struct.CheckCode(code)
+	if codeType == _struct.NeedLogin {
+		return errors.New("need login to get liked songs")
+	} else if codeType != _struct.Success {
+		return errors.New("get liked songs failed")
+	}
+
+	songs := _struct.GetSongsOfPlaylist(response)
+	if songs == nil {
+		return errors.New("get songs of playlist failed")
+	}
+	if len(songs) == 0 {
+		return errors.New("no songs in liked playlist")
+	}
+	slog.Info("[Intelligent Mode API] Step 1: Got liked songs playlist successfully.", slog.Int("count", len(songs)))
+
+	// 2. 随机选择一首歌作为种子
+	slog.Info("[Intelligent Mode API] Step 2: Picking random seed song...")
+	rand.New(rand.NewSource(time.Now().UnixNano()))
+	seedSong := songs[rand.Intn(len(songs))]
+	slog.Info("[Intelligent Mode API] Step 2: Picked random seed song.", slog.String("song", seedSong.Name))
+
+	// 3. 获取智能推荐歌曲
+	slog.Info("[Intelligent Mode API] Step 3: Getting intelligence recommendations...")
+	intelligenceService := service.PlaymodeIntelligenceListService{
+		SongId:       strconv.FormatInt(seedSong.Id, 10),
+		PlaylistId:   strconv.FormatInt(p.netease.user.MyLikePlaylistID, 10),
+		StartMusicId: strconv.FormatInt(seedSong.Id, 10),
+	}
+	code, response = intelligenceService.PlaymodeIntelligenceList()
+	codeType = _struct.CheckCode(code)
+	if codeType == _struct.NeedLogin {
+		return errors.New("need login to get intelligence list")
+	} else if codeType != _struct.Success {
+		return errors.New("get intelligence list failed")
+	}
+	recommendedSongs := _struct.GetIntelligenceSongs(response)
+	slog.Info("[Intelligent Mode API] Step 3: Got intelligence recommendations successfully.", slog.Int("count", len(recommendedSongs)))
+
+	// 4. 创建新播放列表并播放
+	slog.Info("[Intelligent Mode API] Step 4: Initializing new playlist and calling PlaySong...")
+	p.SetMode(types.PmIntelligent)
+	p.playingMenuKey = "Intelligent"
+	_ = p.playlistManager.Initialize(0, append([]structs.Song{seedSong}, recommendedSongs...))
+	p.playlistUpdateAt = time.Now()
+
+	p.PlaySong(p.Playlist()[0], DurationNext)
+	slog.Info("[Intelligent Mode API] Step 4: PlaySong called.")
+
+	// 确保UI刷新
+	p.ctrl <- CtrlSignal{Type: CtrlRerender}
+	slog.Info("[Intelligent Mode API] Finished, requested UI rerender.")
+
+	return nil
 }

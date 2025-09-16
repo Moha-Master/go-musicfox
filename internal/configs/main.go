@@ -5,6 +5,7 @@ import (
 )
 
 type MainOptions struct {
+	HTTPController         HTTPControllerOptions    // HTTP控制器
 	ShowTitle              bool                     // 主界面是否显示标题
 	LoadingText            string                   // 主页面加载中提示
 	PlayerSongLevel        service.SongQualityLevel // 歌曲音质级别
